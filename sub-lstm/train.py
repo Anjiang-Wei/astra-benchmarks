@@ -67,6 +67,8 @@ parser.add_argument(
     type=int,
     default=[-1],
     help='When (which epochs) to divide the learning rate by 10 - accepts multiple')
+parser.add_argument('--torchscript', action='store_true', default=False, help='use TorchScript')
+parser.add_argument('--trace', action='store_true', default=False, help='use jit trace')
 args = parser.parse_args()
 args.tied = True
 
@@ -82,7 +84,6 @@ if torch.cuda.is_available():
 ###############################################################################
 # Load data
 ###############################################################################
-
 
 def model_save(fn):
     with open(fn, 'wb') as f:
@@ -108,9 +109,6 @@ train_data = encoder.batch_encode(train)
 val_data = encoder.batch_encode(val)
 test_data = encoder.batch_encode(test)
 
-eval_batch_size = 70
-test_batch_size = 1
-
 train_source_sampler, val_source_sampler, test_source_sampler = tuple(
     [BPTTBatchSampler(d, args.bptt, args.batch_size, True, 'source') for d in (train, val, test)])
 
@@ -125,8 +123,7 @@ from splitcross import SplitCrossEntropyLoss
 criterion = None
 
 ntokens = encoder.vocab_size
-model = model.RNNModel(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout,
-                       args.dropouth, args.dropouti, args.dropoute, args.wdrop, args.tied)
+model = model.RNNModel(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout)
 ###
 if args.resume:
     print('Resuming model ...')
@@ -164,6 +161,18 @@ total_params = sum(
 print('Args:', args)
 print('Model total parameters:', total_params)
 
+
+if args.torchscript:
+    print("Scripting the module...")
+    model = torch.jit.script(model)
+
+if args.trace:
+    example_input = torch.randn(args.bptt, args.batch_size).to('cuda')
+    print('data.size():{}\n'.format(example_input.size()))
+    print('type(data):{}\n'.format(type(example_input)))
+    print('data:\n{}\n'.format(example_input))
+    model = torch.jit.trace(model, example_input)
+
 ###############################################################################
 # Training code
 ###############################################################################
@@ -175,23 +184,6 @@ def repackage_hidden(h):
     else:
         return tuple(repackage_hidden(v) for v in h)
 
-def evaluate(data_source, source_sampler, target_sampler, batch_size=10):
-    # Turn on evaluation mode which disables dropout.
-    model.eval()
-    total_loss = 0
-    hidden = model.init_hidden(batch_size)
-
-    for source_sample, target_sample in zip(source_sampler, target_sampler):
-        model.train()
-        data = torch.stack([data_source[i] for i in source_sample]).to('cuda')
-        targets = torch.stack([data_source[i] for i in target_sample]).view(-1).to('cuda')
-        output, hidden = model(data, hidden)
-        total_loss += len(data) * criterion(model.decoder.weight, model.decoder.bias, output,
-                                            targets).item()
-        hidden = repackage_hidden(hidden)
-    return total_loss / len(data_source)
-
-
 def train():
     total_loss = 0
     start_time = time.time()
@@ -200,14 +192,16 @@ def train():
     for source_sample, target_sample in zip(train_source_sampler, train_target_sampler):
         model.train()
         data = torch.stack([train_data[i] for i in source_sample]).t_().contiguous().to(device='cuda')
+        #print('data.size():{}\n'.format(data.size()))
+        #print('type(data):{}\n'.format(type(data)))
+        #print('data:\n{}\n'.format(data))
         targets = torch.stack([train_data[i] for i in target_sample]).t_().contiguous().view(-1).to(device='cuda')
 
         # Starting each batch, we detach the hidden state from how it was previously produced.
         # If we didn't, the model would try backpropagating all the way to start of the dataset.
         #hidden = repackage_hidden(hidden)
-        hidden = None
         optimizer.zero_grad()
-        output, hidden, rnn_hs, dropped_rnn_hs = model(data, hidden, return_h=True)
+        output, hidden, rnn_hs, dropped_rnn_hs = model(data)
         raw_loss = criterion(model.decoder.weight, model.decoder.bias, output, targets)
 
         loss = raw_loss
@@ -264,13 +258,3 @@ try:
 except KeyboardInterrupt:
     print('-' * 89)
     print('Exiting from training early')
-
-# Load the best saved model.
-model_load(args.save)
-
-# Run on test data.
-test_loss = evaluate(test_data, test_source_sampler, test_target_sampler, test_batch_size)
-print('=' * 89)
-print('| End of training | test loss {:5.2f} | test ppl {:8.2f} | test bpc {:8.3f}'.format(
-    test_loss, math.exp(test_loss), test_loss / math.log(2)))
-print('=' * 89)
