@@ -18,7 +18,7 @@ parser.add_argument('--nlayers', type=int, default=2, help='number of layers')
 parser.add_argument('--lr', type=float, default=1e-3, help='initial learning rate')
 parser.add_argument('--clip', type=float, default=0.25, help='gradient clipping')
 parser.add_argument('--epochs', type=int, default=500, help='upper epoch limit')
-parser.add_argument('--batch_size', type=int, default=80, metavar='N', help='batch size')
+parser.add_argument('--batch_size', type=int, default=16, metavar='N', help='batch size')
 parser.add_argument('--bptt', type=int, default=70, help='sequence length')
 parser.add_argument(
     '--dropout', type=float, default=0.4, help='dropout applied to layers (0 = no dropout)')
@@ -171,7 +171,7 @@ if args.trace:
     print('data.size():{}\n'.format(example_input.size()))
     print('type(data):{}\n'.format(type(example_input)))
     print('data:\n{}\n'.format(example_input))
-    model = torch.jit.trace(model, example_input)
+    model = torch.jit.trace(model, example_input, check_trace=False)
 
 ###############################################################################
 # Training code

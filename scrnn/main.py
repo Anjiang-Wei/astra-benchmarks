@@ -5,13 +5,12 @@ import numpy as np
 import torch
 import model
 
-from utils import repackage_hidden
 
 parser = argparse.ArgumentParser(description='PyTorch PennTreeBank RNN/LSTM Language Model')
 parser.add_argument(
     '--data', type=str, default='penn_treebank_dataset', help='the name of the dataset to load')
 parser.add_argument(
-    '--model', type=str, default='LSTM', help='type of recurrent net (LSTM, QRNN, GRU)')
+    '--model', type=str, default='QRNN', help='type of recurrent net (LSTM, QRNN, GRU)')
 parser.add_argument('--emsize', type=int, default=400, help='size of word embeddings')
 parser.add_argument('--nhid', type=int, default=1150, help='number of hidden units per layer')
 parser.add_argument('--nlayers', type=int, default=3, help='number of layers')
@@ -41,7 +40,7 @@ parser.add_argument(
     help='amount of weight dropout to apply to the RNN hidden to hidden matrix')
 parser.add_argument('--seed', type=int, default=1111, help='random seed')
 parser.add_argument('--nonmono', type=int, default=5, help='random seed')
-parser.add_argument('--cuda', action='store_true', default=False, help='use CUDA')
+parser.add_argument('--cuda', action='store_true', default=True, help='use CUDA')
 parser.add_argument('--log-interval', type=int, default=200, metavar='N', help='report interval')
 randomhash = ''.join(str(time.time()).split('.'))
 parser.add_argument(
@@ -67,6 +66,8 @@ parser.add_argument(
     type=int,
     default=[-1],
     help='When (which epochs) to divide the learning rate by 10 - accepts multiple')
+parser.add_argument('--torchscript', action='store_true', default=False, help='use TorchScript')
+parser.add_argument('--trace', action='store_true', default=False, help='use jit trace')
 args = parser.parse_args()
 args.tied = True
 
@@ -82,7 +83,6 @@ if torch.cuda.is_available():
 ###############################################################################
 # Load data
 ###############################################################################
-
 
 def model_save(fn):
     with open(fn, 'wb') as f:
@@ -143,21 +143,10 @@ if args.resume:
                 rnn.zoneout = args.wdrop
 ###
 if not criterion:
-    splits = []
-    if ntokens > 500000:
-        # One Billion
-        # This produces fairly even matrix mults for the buckets:
-        # 0: 11723136, 1: 10854630, 2: 11270961, 3: 11219422
-        splits = [4200, 35000, 180000]
-    elif ntokens > 75000:
-        # WikiText-103
-        splits = [2800, 20000, 76000]
-    print('Using', splits)
-    criterion = SplitCrossEntropyLoss(args.emsize, splits=splits, verbose=False)
+    criterion = torch.nn.CrossEntropyLoss()
 ###
 if args.cuda:
-    model = model.cuda()
-    criterion = criterion.cuda()
+    model = model.to('cuda')
 ###
 params = list(model.parameters()) + list(criterion.parameters())
 total_params = sum(
@@ -165,68 +154,38 @@ total_params = sum(
 print('Args:', args)
 print('Model total parameters:', total_params)
 
+if args.torchscript:
+    print("Scripting the module...")
+    model = torch.jit.script(model)
+
+if args.trace:
+    example_input = torch.randn(args.bptt, args.batch_size).to('cuda')
+    print('data.size():{}\n'.format(example_input.size()))
+    print('type(data):{}\n'.format(type(example_input)))
+    print('data:\n{}\n'.format(example_input))
+    model = torch.jit.trace(model, example_input)
+
+
 ###############################################################################
 # Training code
 ###############################################################################
 
-def repackage_hidden(h):
-    """Wraps hidden states in new Tensors, to detach them from their history."""
-    if isinstance(h, torch.Tensor):
-        return h.detach()
-    else:
-        return tuple(repackage_hidden(v) for v in h)
-
-
-def evaluate(data_source, source_sampler, target_sampler, batch_size=10):
-    # Turn on evaluation mode which disables dropout.
-    model.eval()
-    if args.model == 'QRNN':
-        model.reset()
-    total_loss = 0
-    hidden = model.init_hidden(batch_size)
-
-    for source_sample, target_sample in zip(source_sampler, target_sampler):
-        model.train()
-        data = torch.stack([data_source[i] for i in source_sample])
-        targets = torch.stack([data_source[i] for i in target_sample]).view(-1)
-        with torch.no_grad():
-            output, hidden = model(data, hidden)
-        total_loss += len(data) * criterion(model.decoder.weight, model.decoder.bias, output,
-                                            targets).item()
-        hidden = repackage_hidden(hidden)
-    return total_loss / len(data_source)
-
-
 def train():
     # Turn on training mode which enables dropout.
-    if args.model == 'QRNN':
-        model.reset()
     total_loss = 0
     start_time = time.time()
     hidden = model.init_hidden(args.batch_size)
     batch = 0
     for source_sample, target_sample in zip(train_source_sampler, train_target_sampler):
         model.train()
-        data = torch.stack([train_data[i] for i in source_sample]).t_().contiguous()
-        targets = torch.stack([train_data[i] for i in target_sample]).t_().contiguous().view(-1)
+        data = torch.stack([train_data[i] for i in source_sample]).t_().contiguous().to('cuda')
+        targets = torch.stack([train_data[i] for i in target_sample]).t_().contiguous().view(-1).to('cuda')
 
-        # Starting each batch, we detach the hidden state from how it was previously produced.
-        # If we didn't, the model would try backpropagating all the way to start of the dataset.
-        hidden = repackage_hidden(hidden)
         optimizer.zero_grad()
 
-        output, hidden, rnn_hs, dropped_rnn_hs = model(data, hidden, return_h=True)
-        raw_loss = criterion(model.decoder.weight, model.decoder.bias, output, targets)
-
-        loss = raw_loss
-        # Activiation Regularization
-        if args.alpha:
-            loss = loss + sum(
-                args.alpha * dropped_rnn_h.pow(2).mean() for dropped_rnn_h in dropped_rnn_hs[-1:])
-        # Temporal Activation Regularization (slowness)
-        if args.beta:
-            loss = loss + sum(
-                args.beta * (rnn_h[1:] - rnn_h[:-1]).pow(2).mean() for rnn_h in rnn_hs[-1:])
+        print(model)
+        output, hidden, rnn_hs, dropped_rnn_hs = model(data, hidden)
+        loss = criterion(output, targets)
         loss.backward()
 
         # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
@@ -267,67 +226,7 @@ try:
     for epoch in range(1, args.epochs + 1):
         epoch_start_time = time.time()
         train()
-        if 't0' in optimizer.param_groups[0]:
-            tmp = {}
-            for prm in model.parameters():
-                tmp[prm] = prm.data.clone()
-                prm.data = optimizer.state[prm]['ax'].clone()
-
-            val_loss2 = evaluate(val_data, val_source_sampler, val_target_sampler)
-            print('-' * 89)
-            print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
-                  'valid ppl {:8.2f} | valid bpc {:8.3f}'.format(
-                      epoch, (time.time() - epoch_start_time), val_loss2, math.exp(val_loss2),
-                      val_loss2 / math.log(2)))
-            print('-' * 89)
-
-            if val_loss2 < stored_loss:
-                model_save(args.save)
-                print('Saving Averaged!')
-                stored_loss = val_loss2
-
-            for prm in model.parameters():
-                prm.data = tmp[prm].clone()
-
-        else:
-            val_loss = evaluate(val_data, val_source_sampler, val_target_sampler, eval_batch_size)
-            print('-' * 89)
-            print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
-                  'valid ppl {:8.2f} | valid bpc {:8.3f}'.format(
-                      epoch, (time.time() - epoch_start_time), val_loss, math.exp(val_loss),
-                      val_loss / math.log(2)))
-            print('-' * 89)
-
-            if val_loss < stored_loss:
-                model_save(args.save)
-                print('Saving model (new best validation)')
-                stored_loss = val_loss
-
-            if args.optimizer == 'sgd' and 't0' not in optimizer.param_groups[0] and (
-                    len(best_val_loss) > args.nonmono and
-                    val_loss > min(best_val_loss[:-args.nonmono])):
-                print('Switching to ASGD')
-                optimizer = torch.optim.ASGD(
-                    model.parameters(), lr=args.lr, t0=0, lambd=0., weight_decay=args.wdecay)
-
-            if epoch in args.when:
-                print('Saving model before learning rate decreased')
-                model_save('{}.e{}'.format(args.save, epoch))
-                print('Dividing learning rate by 10')
-                optimizer.param_groups[0]['lr'] /= 10.
-
-            best_val_loss.append(val_loss)
 
 except KeyboardInterrupt:
     print('-' * 89)
     print('Exiting from training early')
-
-# Load the best saved model.
-model_load(args.save)
-
-# Run on test data.
-test_loss = evaluate(test_data, test_source_sampler, test_target_sampler, test_batch_size)
-print('=' * 89)
-print('| End of training | test loss {:5.2f} | test ppl {:8.2f} | test bpc {:8.3f}'.format(
-    test_loss, math.exp(test_loss), test_loss / math.log(2)))
-print('=' * 89)

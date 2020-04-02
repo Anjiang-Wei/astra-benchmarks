@@ -31,7 +31,6 @@ class RNNModel(nn.Module):
         ]
 
         self.rnns = torch.nn.ModuleList(self.rnns)
-        self.rnn = SubLSTM(ninp, nhid, num_layers=2)
         self.decoder = nn.Linear(nhid, ntoken)
 
         # Optionally tie weights as in:
