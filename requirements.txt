@@ -1,0 +1,6 @@
+torch
+pytorch-nlp
+pytorch-sublstm
+cupy
+pyvrtc
+
